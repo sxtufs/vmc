@@ -1,0 +1,15 @@
+# Build and local tooling state
+.gradle/
+build/
+app/build/
+local.properties
+.platform/
+gradle-import-*/
+
+# Generated metadata and artifacts
+*.apk
+*.dex
+
+# CI-built native runtime artifacts
+app/src/main/assets/vmp/*.so
+native/libffi/

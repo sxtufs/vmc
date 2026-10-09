@@ -1,0 +1,166 @@
+# Compiles and checks the pure-JVM packer sources used by the app.
+name: Packer JVM format checks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "app/src/main/java/com/vmp/packer/**"
+      - "ci/**"
+      - ".github/workflows/packer-tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "app/src/main/java/com/vmp/packer/**"
+      - "ci/**"
+      - ".github/workflows/packer-tests.yml"
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    env:
+      PSRC: app/src/main/java/com/vmp/packer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard tree layout
+        run: |
+          test -f "$PSRC/DexRewriter.kt" && test -f ci/FormatCheck.kt || {
+            echo "::error::need ci/FormatCheck.kt and $PSRC/*.kt at the repo root." >&2
+            exit 1
+          }
+          test ! -e packer || {
+            echo "::error::packer/ is a removed duplicate of the app sources - delete it." >&2
+            exit 1
+          }
+
+      # Kotlin block comments can nest; catch malformed KDoc before compilation.
+      - name: Guard doc-comment nesting
+        run: |
+          cat > /tmp/ktnest.awk <<'AWK'
+          BEGIN { st = 0; depth = 0; bad = 0 }
+          {
+            line = $0; i = 1; n = length(line)
+            while (i <= n) {
+              c2 = substr(line, i, 2)
+              if (st == 0) {
+                if (c2 == "//") { i = n + 1; continue }
+                if (c2 == "/*") { st = 2; depth = 1; i += 2; continue }
+                if (substr(line, i, 1) == "\"") { st = 3; i++; continue }
+                i++
+              } else if (st == 2) {
+                if (c2 == "*/") { depth--; if (depth == 0) st = 0; i += 2; continue }
+                if (c2 == "/*") {
+                  printf "%s:%d: nested /* opens a second block comment\n", FILENAME, FNR
+                  bad = 1; i += 2; continue
+                }
+                i++
+              } else {
+                c = substr(line, i, 1)
+                if (c == "\\") { i += 2; continue }
+                if (c == "\"") st = 0
+                i++
+              }
+            }
+          }
+          END {
+            if (depth > 0) {
+              printf "%s:%d: block comment still open at end of file\n", FILENAME, FNR
+              bad = 1
+            }
+            exit bad
+          }
+          AWK
+          fail=0
+          while IFS= read -r f; do
+            awk -f /tmp/ktnest.awk "$f" || fail=1
+          done < <(find app/src ci -name '*.kt' | sort)
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::a nested /* in a Kotlin doc comment swallows the rest of that file. Reword it - 'native-library entry', not a path glob (see AbiPreflight.declaredAbis)."
+            exit 1
+          fi
+          echo "doc-comment nesting: clean across $(find app/src ci -name '*.kt' | wc -l) files"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+
+      - name: Install build-tools (d8)
+        run: sdkmanager "build-tools;36.0.0" >/dev/null
+
+      - name: Install kotlinc 2.2.10
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            -o kc.zip https://github.com/JetBrains/kotlin/releases/download/v2.2.10/kotlin-compiler-2.2.10.zip
+          echo "302d1d8e671e5c3207e6ed62ff11fb555462a628e22a1158254dcaaf7e7394bc  kc.zip" \
+            | sha256sum -c -
+          unzip -q kc.zip -d "$HOME"
+          echo "$HOME/kotlinc/bin" >> "$GITHUB_PATH"
+          echo "KOTLIN_LIB=$HOME/kotlinc/lib" >> "$GITHUB_ENV"
+
+      - name: Fetch JVM deps
+        run: |
+          mkdir -p libs
+          g=https://dl.google.com/dl/android/maven2
+          curl --fail --silent --show-error --location --retry 3 \
+            -o libs/dexlib2.jar $g/com/android/tools/smali/smali-dexlib2/3.0.10/smali-dexlib2-3.0.10.jar
+          curl --fail --silent --show-error --location --retry 3 \
+            -o libs/util.jar $g/com/android/tools/smali/smali-util/3.0.10/smali-util-3.0.10.jar
+          curl --fail --silent --show-error --location --retry 3 \
+            -o libs/guava.jar https://repo1.maven.org/maven2/com/google/guava/guava/33.7.1-android/guava-33.7.1-android.jar
+          cat <<'EOF' | sha256sum -c -
+          688dee6a46962a4dd1774b64be926534b0b6504bfd5d5c9f89c0f5af284f50c1  libs/dexlib2.jar
+          cc2ef8349765644e4b15371f2c9f77d69b5412a094a38fe5fd992a124b7322fe  libs/util.jar
+          603942ca694ea40060a0a54dd620c05668c904736bb4e16c80760e77e69c107d  libs/guava.jar
+          EOF
+
+      # Keep the standalone JVM lane on the same library versions as the app.
+      - name: Assert CI jar pins match app/build.gradle.kts
+        run: |
+          G=app/build.gradle.kts
+          W=.github/workflows/packer-tests.yml
+          fail=0
+          gv=$(sed -n 's/.*smali-dexlib2:\([0-9.]*\).*/\1/p' "$G" | head -1)
+          gg=$(sed -n 's/.*guava:\([0-9.]*\).*/\1/p' "$G" | head -1)
+          cv=$(sed -n 's#.*/smali-dexlib2/\([0-9.]*\)/.*#\1#p' "$W" | head -1)
+          uv=$(sed -n 's#.*/smali-util/\([0-9.]*\)/.*#\1#p' "$W" | head -1)
+          cg=$(sed -n 's#.*/guava/\([0-9.]*\)[a-z-]*/.*#\1#p' "$W" | head -1)
+          for pair in "dexlib2 $gv $cv" "util $cv $uv" "guava $gg $cg"; do
+            set -- $pair
+            if [ -n "$2" ] && [ "$2" = "$3" ]; then
+              echo "pin ok: $1 = $2"
+            else
+              echo "DRIFT: $1 = [$2] vs [$3]"; fail=1
+            fi
+          done
+          [ "$fail" = 0 ] || exit 1
+
+      # Android-only and UI code stay out of this JVM-only compilation lane.
+      - name: Compile the pure-JVM half + harness + fixture
+        run: |
+          SRC=$(ls "$PSRC"/*.kt | grep -vE '/(Packer|MainActivity|SelfTest|ApkSigner|JksProfileStore|JksReader|SecretStore|ScanCache|MaxHeightListView|PackagePreviewAdapter)\.kt$')
+          echo "compiling:"; echo "$SRC" | sed 's/^/  /'
+          kotlinc -classpath "libs/dexlib2.jar:libs/util.jar:libs/guava.jar" \
+            $SRC ci/TestSubject.kt ci/FormatCheck.kt ci/FuzzCheck.kt -d classes
+
+      - name: Dex the fixture
+        run: |
+          mkdir -p dexout
+          "$ANDROID_HOME/build-tools/36.0.0/d8" --release --min-api 24 \
+            --output dexout $(find classes -path 'classes/fixt/*' -name '*.class')
+
+      - name: Format checks
+        run: |
+          java -cp "classes:libs/dexlib2.jar:libs/util.jar:libs/guava.jar:$KOTLIN_LIB/kotlin-stdlib.jar" \
+            FormatCheckKt dexout/classes.dex
+
+      - name: Deterministic DEX/AXML/VMC mutation fuzz
+        run: |
+          java -cp "classes:libs/dexlib2.jar:libs/util.jar:libs/guava.jar:$KOTLIN_LIB/kotlin-stdlib.jar" \
+            FuzzCheckKt dexout/classes.dex

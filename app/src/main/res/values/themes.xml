@@ -1,0 +1,21 @@
+<resources>
+    <style name="Theme.VMPacker" parent="Theme.Material3.DayNight">
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
+
+    <style name="VmpackerToolbarTitle">
+        <item name="android:textSize">24sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:fontFamily">sans</item>
+    </style>
+
+    <!-- Custom toolbar replaces the framework ActionBar. -->
+    <style name="Theme.VMPacker.NoActionBar" parent="Theme.VMPacker">
+        <item name="windowActionBar">false</item>
+        <item name="windowNoTitle">true</item>
+        <item name="android:statusBarColor">@android:color/white</item>
+        <item name="android:navigationBarColor">@android:color/white</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>

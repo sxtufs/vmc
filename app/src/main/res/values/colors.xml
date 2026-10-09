@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="primary">#FF6200EE</color>
+    <color name="on_primary">#FFFFFFFF</color>
+    <color name="ic_launcher_background">#3DDC84</color>
+
+    
+    <color name="vmpPurple">#FF5B4AC5</color>
+    <color name="vmpPurpleDeep">#FF4A3AAE</color>
+    <color name="vmpPurpleLight">#FF6C5CC5</color>
+    <color name="vmpHeaderBg">#FFF5F1FC</color>
+    <color name="vmpBorder">#FFD9D0F2</color>
+    <color name="vmpTextPrimary">#FF1F1D2B</color>
+    <color name="vmpTextSecondary">#FF8A8798</color>
+    <color name="vmpOnPrimary">#FFFFFFFF</color>
+</resources>

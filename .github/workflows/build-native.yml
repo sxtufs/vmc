@@ -1,0 +1,480 @@
+# Builds and verifies the native runtime for every shipped ABI.
+name: Build Android Native Library
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "native/**"
+      - ".github/workflows/build-native.yml"
+  push:
+    branches: [main]
+    paths:
+      - "native/**"
+      - ".github/workflows/build-native.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install NDK r30
+        run: |
+          sdkmanager "ndk;30.0.16248370"
+          NDK="$ANDROID_HOME/ndk/30.0.16248370"
+          test -d "$NDK" || { echo "NDK not found at $NDK"; exit 1; }
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool
+
+      # Protects packer/runtime format and release-artifact contracts.
+      - name: Verify native source
+        run: |
+          GUARDS_FATAL=1
+          e() {
+            if [ "$GUARDS_FATAL" = 1 ]; then echo "ERROR: $1"; exit 1
+            else echo "::warning::guard drifted (non-fatal): $1"; fi
+          }
+
+          grep -qE 'VMC_CONTAINER_VERSION[[:space:]]*=[[:space:]]*[0-9]' src/vmp.cpp \
+            || e "vmp.cpp has no VMPC envelope version constant"
+          grep -q "vmpDecodeBlob" src/vmp.cpp             || e "vmp.cpp lost container decryption"
+          grep -q 'VMP_LOADER_CLASS_TEMPLATE "com/error/vm"' src/vmp.cpp \
+            || e "vmp.cpp lost the kLoaderClass template - the packer's loader-class patch anchors on it"
+          grep -q 'RegisterNatives(loader' src/vmp.cpp \
+            || e "vmp.cpp lost the JNI_OnLoad loader-class bind"
+          grep -q '"(Landroid/content/res/AssetManager;IZLandroid/content/Context;)V"' src/vmp.cpp \
+            || e "vmp.cpp's initVM signature no longer matches what DexRewriter generates - fix BOTH or the RegisterNatives bind fails at runtime"
+          grep -qE 'typedef[[:space:]]+uint64_t[[:space:]]+Reg' src/interpreter.cpp \
+            || e "interpreter.cpp lost the 64-bit Reg fix"
+          grep -q "VMP_RELEASE_QUIET" src/vmp_log.h       || e "vmp_log.h lost the quiet-log policy"
+          grep -q "__android_log_print(ANDROID_LOG_ERROR" src/vmp_log.h || e "vmp_log.h has no plain LOGE"
+          for f in src/vmp.cpp src/vmp_file.cpp src/interpreter.cpp; do
+            grep -q 'include "vmp_log.h"' "$f" || e "$f not using vmp_log.h"
+          done
+
+          grep -q 'g_keySlot\[112\]' src/vmp.cpp || e "vmp.cpp lost the 112-byte key-slot object (MAGIC|BUILD_CONST|encKey|CERT_PIN)"
+          grep -q 'vmpCheckCertPin' src/vmp.cpp || e "vmp.cpp lost the signature-pin check - the CERT_PIN slot region would never be consumed"
+          grep -q '"Unable to initialize context"' src/vmp.cpp \
+            || e "initVM failure paths must throw the generic 'Unable to initialize context'"
+          grep -q 'Corrupt VMC container' src/vmp.cpp \
+            && e "leaky exception text is back - every initVM failure shares ONE generic message"
+          grep -q '#define VMP_ANTIDBG_HARD 0' src/vmp.cpp || e "anti-dbg shipped policy drifted from SOFT"
+          grep -q 'vmpAntiDbgScore' src/vmp.cpp || e "vmp.cpp lost the anti-instrumentation probe"
+          grep -q 'vmpLazyFileReady' src/vmp.cpp || e "vmp.cpp lost the key-retirement hook"
+          grep -q 'vmpLazyFileReady' src/vmp_file.cpp || e "vmp_file.cpp never reports lazy-decrypt completion - g_vmcKey would never be wiped"
+          grep -q '"VMC.payload"' src/vmp.cpp || e "vmp.cpp renamed the container asset literal - the packer's per-output asset-name patch anchors on it"
+          grep -q 'vmp_decryptInsns' src/vmp.cpp || e "vmp.cpp lost the lazy insn decrypt"
+          grep -q 'vmpVerifyApkSignature' src/vmp.cpp \
+            || e "vmp.cpp lost full APK v2/v3 signature verification - certificate-only cache spoofing would pass"
+          grep -q 'verifyJavaSignature' src/vmp_apk_verify.cpp \
+            || e "full APK verifier lost signed-data cryptographic verification"
+          grep -q 'computeContentDigest' src/vmp_apk_verify.cpp \
+            || e "full APK verifier lost the signed-content digest check"
+          test -f src/vmp_apk_verify.h || e "full APK verifier header missing"
+          grep -q 'src/vmp_apk_verify.cpp' CMakeLists.txt \
+            || e "CMakeLists.txt does not compile the full APK verifier"
+          grep -q 'insn_state_' src/vmp_file.cpp || e "vmp_file.cpp lost the decrypt state array"
+          test -f src/vmp_obf.h || e "src/vmp_obf.h missing (MBA header)"
+          grep -q 'include "vmp_obf.h"' src/vmp.cpp || e "vmp.cpp does not use vmp_obf.h"
+
+          grep -q "vmpLogE" src/vmp_log.h && e "abandoned LOGE string encryption is back"
+          grep -qE "loadPerDexVmcAssets[[:space:]]*\(" src/vmp.cpp && e "legacy per-dex VMC loader is back"
+          grep -q "Java_com_" src/vmp.cpp && e "a name-bound Java_com_* loader export is back - bind via RegisterNatives instead"
+          grep -qE "VMP2_MAGIC[[:space:]]*=|==[[:space:]]*VMP2_MAGIC" src/vmp.cpp && e "plaintext VMP2 acceptance path is back"
+          grep -qE 'g_vmcKey\[i[[:space:]]*%[[:space:]]*sizeof' src/vmp.cpp && e "old repeating-key XOR keystream is back"
+
+          test -f src/miniz.c || e "src/miniz.c missing (see src/readme_miniz.txt)"
+          test -f src/miniz.h || e "src/miniz.h missing (see src/readme_miniz.txt)"
+          grep -q 'include "miniz.h"' src/vmp.cpp || e "vmp.cpp does not include miniz.h"
+          grep -qF "include <zlib.h>" src/vmp.cpp && e "vmp.cpp includes zlib.h again"
+          grep -q "tinfl_decompress" src/vmp.cpp || e "vmp.cpp missing the tinfl_decompress call"
+          grep -q "vmp_crc32" src/vmp.cpp || e "vmp.cpp missing the local vmp_crc32"
+          grep -qE "tinfl_decompressor infl[[:space:]]*=[[:space:]]*\{\}" src/vmp.cpp \
+            || e "tinfl_decompressor not zero-initialised"
+          for f in TINFL_FLAG_PARSE_ZLIB_HEADER TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF; do
+            grep -q "$f" src/vmp.cpp || e "tinfl missing $f"
+          done
+
+          grep -q "src/miniz.c" CMakeLists.txt        || e "CMakeLists.txt does not compile src/miniz.c"
+          grep -q 'add_library(VMP SHARED' CMakeLists.txt || e "CMake target renamed - the packer's SONAME patch anchors on libVMP.so"
+          grep -q "project(VMP C CXX)" CMakeLists.txt || e "CMakeLists.txt has not enabled the C language"
+          grep -q -- "--gc-sections" CMakeLists.txt   || e "CMakeLists.txt missing --gc-sections"
+          grep -q "VMP_QUIET_LOGS" CMakeLists.txt     || e "CMakeLists.txt missing the quiet-log option"
+          grep -q -- "--exclude-libs,ALL" CMakeLists.txt || e "CMakeLists.txt missing --exclude-libs"
+          grep -q -- "max-page-size=16384" CMakeLists.txt || e "CMakeLists.txt lost 16 KB page alignment (required for 16 KB devices; paired with the LOAD check below and ApkBuilder's 16384 zip alignment)"
+          grep -q -- "-fno-unwind-tables" CMakeLists.txt || e "CMakeLists.txt missing the unwind-table flags"
+          grep -q -- "--no-eh-frame-hdr" CMakeLists.txt || e "CMakeLists.txt missing the no-EH-frame-header link flag"
+          test -f strip_unwind_headers.py || e "release unwind-header cleanup script missing"
+          grep -qF '$<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>' CMakeLists.txt \
+            || e "CMakeLists.txt does not disable C++ exceptions for every build"
+          grep -qF '$<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>' CMakeLists.txt \
+            || e "CMakeLists.txt does not disable RTTI for every build"
+          awk '
+            /^[[:space:]]*#/                         { next }
+            /^[[:space:]]*if[[:space:]]*\(/        { depth++ }
+            /^[[:space:]]*endif/                   { if (depth > 0) depth-- }
+            /fno-exceptions|fno-rtti/ && depth > 0 { bad = 1 }
+            END                                    { exit bad }
+          ' CMakeLists.txt \
+            || e "C++ RTTI/EH flags are nested under a conditional build option"
+          grep -qE "^[[:space:]]*z\)?$" CMakeLists.txt && e "CMakeLists.txt still links zlib"
+          awk '
+            /^[[:space:]]*if[[:space:]]*\(/ { depth++ }
+            /^[[:space:]]*endif/            { if (depth > 0) depth-- }
+            /--exclude-libs,ALL/ && depth > 0 { bad = 1 }
+            END                             { exit bad }
+          ' CMakeLists.txt \
+            || e "--exclude-libs,ALL sits inside an if() block"
+
+          grep -qE 'bool[[:space:]]+jumped[[:space:]]*=[[:space:]]*false' src/interpreter.cpp \
+            || e "lost the sparse-switch jumped flag"
+          grep -qE '!jumped.*next[[:space:]]*=[[:space:]]*pc[[:space:]]*\+[[:space:]]*3' src/interpreter.cpp \
+            || e "sparse-switch default is unconditional again"
+          [ "$(grep -c 'SetCharArrayRegion' src/interpreter.cpp)" -ge 2 ] || e "fill-array-data char[] dispatch missing"
+          [ "$(grep -c 'SetBooleanArrayRegion' src/interpreter.cpp)" -ge 2 ] || e "fill-array-data boolean[] dispatch missing"
+          [ "$(grep -cE 'case 0x(99|b9|e1|a4|c4): x = x >> ' src/interpreter.cpp)" -eq 5 ] \
+            || e "an int/long shr form is not sign-propagating"
+          [ "$(grep -cE 'case 0x(9a|ba|e2|a5|c5): x = \(int(32|64)_t\)\(\(uint' src/interpreter.cpp)" -eq 5 ] \
+            || e "an int/long ushr form lost its unsigned cast"
+
+          grep -q 'VMP_ABI_TOKEN "vmp.abi.10"' src/vmp_abi.h || e "token is not vmp.abi.10 - CI, packer and header must agree"
+          grep -q 'VMP_ABI_MAX_CONTAINER_VERSION 6u' src/vmp_abi.h || e "runtime no longer parses container version 6"
+          grep -q 'VMP_IR_ACCESS_BIT 0x10000000u' src/vmp_ir.h \
+            || e "runtime IR access bit moved"
+          grep -q 'IR_ACCESS_BIT = 0x10000000' ../app/src/main/java/com/vmp/packer/IrCodec.kt \
+            || e "packer IR access bit moved"
+          grep -q 'VMP_FUSE_SETTER 0xfa' src/vmp_ir.h \
+            || e "runtime fused marker SETTER moved"
+          grep -q 'FUSE_SETTER = 0xfa' ../app/src/main/java/com/vmp/packer/IrCodec.kt \
+            || e "packer fused marker SETTER moved"
+          grep -q 'case 0xfd:' src/interpreter.cpp \
+            || e "interpreter missing fused const-wide case"
+          grep -q 'case 0xfe:' src/interpreter.cpp \
+            || e "interpreter missing fused setter-invoke case"
+          grep -q 'case 0xff:' src/interpreter.cpp \
+            || e "interpreter missing fused iget-if case"
+          grep -q 'case 0x5f:' src/interpreter.cpp && grep -q 'case 0x60:' src/interpreter.cpp \
+            || e "interpreter field/static family boundary moved - re-audit"
+          grep -q 'FUSE_IPUT = (0x59..0x5f)' ../app/src/main/java/com/vmp/packer/IrCodec.kt \
+            || e "FUSE_IPUT left the instance-put family - static ops must never fuse as stores"
+          grep -q 'INVOKE_OPS = (0x6e..0x78)' ../app/src/main/java/com/vmp/packer/IrCodec.kt \
+            || e "INVOKE_OPS no longer starts at the invoke family - 0x6d is sput-short"
+          grep -q 'if (opByte in 0xfa..0xff) return null' ../app/src/main/java/com/vmp/packer/IrCodec.kt \
+            || e "the fused-marker collision guard is gone - a marker could alias a real opcode"
+          if grep -nE 'memset\(g_(insnKey|vmcKey|keySlot)' src/vmp.cpp; then
+            e "DSE-unsafe memset on a key global (see wipe policy in vmp.cpp)"; exit 1
+          fi
+          grep -q 'VMC_CONTAINER_VERSION = 4' src/vmp.cpp \
+            || e "runtime envelope version is not 4"
+          grep -q 'VMC_TOC_ENTRY_SIZE = 48' src/vmp.cpp \
+            || e "runtime TOC stride is not 48 - tag field lost"
+          grep -q '12 + 48 \* vmcs.size' ../app/src/main/java/com/vmp/packer/ApkBuilder.kt \
+            || e "packer TOC stride is not 48 - tag field lost"
+          grep -q '0x2E17A3C2' src/vmp.cpp \
+            && grep -q '0x2E17A3C2' ../app/src/main/java/com/vmp/packer/ApkBuilder.kt \
+            || e "auth-KDF counter missing on one side - envelope domains diverged"
+          grep -q 'VMP_FUSE_SETINV 0xfe' src/vmp_ir.h \
+            || e "runtime fused marker SETINV moved"
+          grep -q 'FUSE_SETTER_INVOKE = 0xfe' ../app/src/main/java/com/vmp/packer/IrCodec.kt \
+            || e "packer fused marker SETINV moved"
+          grep -q 'PERM_LUT_COUNT = 8' ../app/src/main/java/com/vmp/packer/InsnPerm.kt \
+            || e "packer PERM_LUT_COUNT is not 8 - vmp_file.cpp must match"
+          grep -q '#define VMP_PERM_LUT_COUNT 8' src/vmp_file.cpp \
+            || e "runtime VMP_PERM_LUT_COUNT is not 8 - InsnPerm.kt must match"
+          grep -q 'MULTI_PERM_CAP = 7' ../app/src/main/java/com/vmp/packer/InsnPerm.kt \
+            || e "packer MULTI_PERM_CAP is not 7 - the token level that gates v5 blobs"
+          grep -q 'FEATURE_SPARSE_DESCRIPTORS = 1' src/vmp_file.cpp || e "vmp_file.cpp feature bit is not 1"
+          grep -q 'FEATURE_SPARSE_DESCRIPTORS = 1' ../app/src/main/java/com/vmp/packer/VmcWriter.kt || e "VmcWriter feature bit is not 1"
+          grep -q 'VMP_ABI_MAX_CONTAINER_VERSION' src/vmp_file.cpp || e "version gate no longer bounded by the ABI constant"
+          grep -q 'VMP_ABI_TOKEN' src/vmp_file.cpp || e "vmp_file.cpp no longer emits the token - it would vanish from the .so"
+          grep -q 'rd_u32(data + 92)' src/vmp_file.cpp \
+            || e "vmp_file.cpp lost the perm header slot (92) - v4/v5 blobs would run canonical or worse"
+          grep -q 'malformed perm section' src/vmp_file.cpp \
+            || e "perm validation was removed - tampered v4 containers must fail open() before getInsns()"
+
+          python3 - <<'PYEOF'
+          import re, sys
+          KEY = 0x5C
+          src = open('src/vmp.cpp').read()
+          sig = re.search(r'#define VMP_INITVM_SIG\s*\\\s*\n\s*"([^"]+)"', src).group(1)
+          def arr(n):
+              m = re.search(r'k' + n + r'InitVM\[\]\s*=\s*\{(.*?)\};', src, re.S)
+              if not m:
+                  sys.exit("missing k" + n + "InitVM array")
+              ents = re.findall(r"'([^']*)'\s*\^\s*0x5C", m.group(1))
+              if not ents:
+                  sys.exit("k" + n + "InitVM has no XOR'd entries - plaintext array?")
+              return ''.join('\x00' if e == '\\0' else e for e in ents).rstrip('\x00')
+          if arr('Sig') != sig:
+              sys.exit("kSigInitVM does not decode to VMP_INITVM_SIG: " + repr(arr('Sig')))
+          if arr('Name') != 'initVM':
+              sys.exit("kNameInitVM does not decode to initVM: " + repr(arr('Name')))
+          print("#8 arrays decode to the source contract")
+          PYEOF
+
+          echo "Native source verified."
+          sha1sum src/vmp.cpp src/vmp_file.cpp src/interpreter.cpp src/vmp_log.h src/vmp_file.h src/vmp_abi.h src/vmp_obf.h || true
+
+      - name: Build libffi
+        run: |
+          chmod +x build_libffi.sh
+          ./build_libffi.sh "$ANDROID_NDK_HOME"
+
+      - name: payload offset arithmetic guard
+        run: |
+          if grep -n 'int ppc = pc + off;' src/interpreter.cpp; then
+            echo "raw pc + off is back: use the int64 widen + clamp instead"
+            exit 1
+          fi
+          echo "payload offset guard: ok"
+
+      - name: container parser fuzz (host)
+        run: |
+          CC=clang CXX=clang++ cmake -S . -B build-fuzz -DVMP_FUZZ=ON
+          cmake --build build-fuzz --target vmp_seeds vmp_fuzz -j"$(nproc)"
+          printf abc > /tmp/abc.bin
+          ./build-fuzz/vmp_seeds -digest /tmp/abc.bin > /tmp/got.txt
+          test "$(cat /tmp/got.txt)" = "$(sha256sum /tmp/abc.bin | cut -d' ' -f1)" \
+            || { echo "harness SHA-256 disagrees with coreutils"; exit 1; }
+          mkdir -p seeds
+          ./build-fuzz/vmp_seeds -dumpseed=seeds
+          ./build-fuzz/vmp_fuzz seeds -max_total_time=120 -timeout=10 \
+            -artifact_prefix=/tmp/fuzz-crash-
+          echo "container-parser fuzz lane: clean"
+
+      # Executes the real native vmInterpret() directly on the host JVM.
+      # No emulator, APK install, or Android runtime is involved.
+      - name: Host native VM opcode tests
+        run: |
+          rm -rf build-opcode-tests
+          cmake -S . -B build-opcode-tests -DVMP_OPCODE_TESTS=ON
+          export LD_LIBRARY_PATH="$JAVA_HOME/lib/server:${LD_LIBRARY_PATH:-}"
+          cmake --build build-opcode-tests --target vmp_opcode_tests -j"$(nproc)"
+          ./build-opcode-tests/vmp_opcode_tests
+
+      # Release libraries are the authoritative runtime overlaid into the packer APK.
+      - name: Build all ABIs (release)
+        id: build_release
+        run: |
+          for pair in "arm64:arm64-v8a" "armv7:armeabi-v7a" "x86_64:x86_64" "x86:x86"; do
+            DIR="build-${pair%%:*}"; ABI="${pair##*:}"
+            echo "===== release: $ABI ====="
+            rm -rf "$DIR"
+            cmake -S . -B "$DIR" \
+              -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="$ABI" -DANDROID_PLATFORM=android-21 \
+              -DCMAKE_BUILD_TYPE=Release -DVMP_QUIET_LOGS=ON
+            cmake --build "$DIR" --parallel
+          done
+
+      # Debug retains diagnostics for investigation and is not a release artifact.
+      - name: Build debug .so (arm64-v8a)
+        id: build_debug
+        run: |
+          rm -rf build-arm64-debug
+          cmake -S . -B build-arm64-debug \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-21 \
+            -DCMAKE_BUILD_TYPE=Release -DVMP_QUIET_LOGS=OFF
+          cmake --build build-arm64-debug --parallel
+
+      # Strip release-only metadata; debug retains unwind data for diagnostics.
+      - name: Strip toolchain provenance and release EH metadata
+        run: |
+          BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          OBJCPY="$BIN/llvm-objcopy"
+          for d in build-arm64 build-armv7 build-x86_64 build-x86; do
+            SO="$d/libVMP.so"
+            [ -f "$SO" ] || { echo "ERROR: $SO missing"; exit 1; }
+            "$OBJCPY" \
+              --remove-section=.comment \
+              --remove-section=.note.gnu.build-id \
+              --remove-section=.eh_frame \
+              --remove-section=.eh_frame_hdr \
+              --remove-section=.gcc_except_table \
+              --remove-section=.ARM.exidx \
+              --remove-section=.ARM.extab \
+              --remove-section=.ARM.extab__lcxx_override \
+              "$SO"
+            python3 strip_unwind_headers.py "$SO"
+          done
+
+          SO=build-arm64-debug/libVMP.so
+          [ -f "$SO" ] || { echo "ERROR: $SO missing"; exit 1; }
+          "$OBJCPY" \
+            --remove-section=.comment \
+            --remove-section=.note.gnu.build-id \
+            "$SO"
+
+          if strings build-arm64/libVMP.so | grep -qE 'clang version|GCC:|GNU '; then
+            echo "ERROR: compiler provenance still present after strip"; exit 1
+          fi
+          TOKEN="$(sed -n 's/.*#define VMP_ABI_TOKEN "\([^"]*\)".*/\1/p' src/vmp_abi.h)"
+          strings build-arm64/libVMP.so | grep -q "$TOKEN" \
+            || { echo "ERROR: strip removed the $TOKEN token"; exit 1; }
+          grep -qF 'Pkg.Revision = 30.0.16248370' \
+            "$ANDROID_NDK_HOME/source.properties" \
+            || { echo "ERROR: unexpected NDK revision"; cat "$ANDROID_NDK_HOME/source.properties"; exit 1; }
+          echo "Option C strip done: compiler fingerprint gone, token intact, NDK revision verified."
+
+      # Validate linked artifacts, not only source files and CMake configuration.
+      - name: Verify the built .so files
+        run: |
+          BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          fail() { echo "ERROR: $1"; exit 1; }
+
+          TOKEN="$(sed -n 's/.*#define VMP_ABI_TOKEN "\([^"]*\)".*/\1/p' src/vmp_abi.h)"
+          test -n "$TOKEN" || fail "could not read VMP_ABI_TOKEN from src/vmp_abi.h"
+          echo "expected capability token: $TOKEN"
+
+          check_so() {
+            SO="$1"; ABI="$2"; MODE="$3"
+            [ -f "$SO" ] || fail "$SO missing ($ABI $MODE)"
+            echo "================ $ABI ($MODE) ================"
+            strings "$SO" > /tmp/so-strings.txt
+
+            grep -q "$TOKEN" /tmp/so-strings.txt \
+              || fail "$ABI has no $TOKEN - stale sources predating the capability token; the packer cannot probe it"
+
+            if "$BIN/llvm-nm" -D --undefined-only "$SO" \
+                | grep -qE ' (__cxa_throw|__cxa_begin_catch|__cxa_end_catch|__cxa_rethrow|__gxx_personality_v0|__dynamic_cast|_ZTI|_ZTV)(@[^[:space:]]+)?$'; then
+              fail "$ABI imports C++ exception or RTTI runtime symbols"
+            fi
+
+            if [ "$MODE" = "release" ]; then
+              if "$BIN/llvm-readelf" -SW "$SO" \
+                  | grep -qE '\.(eh_frame(_hdr)?|gcc_except_table|ARM\.(exidx|extab))'; then
+                fail "$ABI release artifact still contains EH/unwind sections"
+              fi
+              if "$BIN/llvm-readelf" -l "$SO" \
+                  | grep -qE 'GNU_EH_FRAME|EXIDX'; then
+                fail "$ABI release artifact still contains an EH/unwind program header"
+              fi
+              for s in "JNI_OnLoad: VMP" "logguard: static dispatch guard reached" \
+                       "Registered native:" "Log-shaped call resolved to a class" \
+                       "no more VMC files" "ClassLoader.loadClass" \
+                       "vmp-reg: %s failed for" "vmp-reg: class lookup failed for" \
+                       "JNI_OnLoad: GetEnv failed" "JNI_OnLoad: loader class not found" \
+                       "JNI_OnLoad: loader native bind failed"; do
+                if grep -qF "$s" /tmp/so-strings.txt; then
+                  fail "$ABI carries compiled-out INFO/LOGDIAG string: $s"
+                fi
+              done
+              [ "$(grep -cx 'com/error/vm' /tmp/so-strings.txt)" -eq 1 ] \
+                || fail "$ABI loader-class literal not exactly-once - packer's patchLoaderClassName would refuse this build"
+              if grep -qix 'initVM' /tmp/so-strings.txt; then
+                fail "$ABI carries the loader method name as a string - kNameInitVM regressed to a literal"
+              fi
+              if grep -q 'AssetManager;IZ' /tmp/so-strings.txt; then
+                fail "$ABI carries the initVM JNI signature - kSigInitVM regressed to a literal"
+              fi
+              grep -q 'com_error_vm' /tmp/so-strings.txt \
+                && fail "$ABI carries a name-bound loader export - initVM must be static + RegisterNatives-bound"
+            else
+              if ! grep -q "JNI_OnLoad: VMP" /tmp/so-strings.txt; then
+                fail "$ABI debug build has NO INFO strings - VMP_QUIET_LOGS=OFF did not apply"
+              fi
+              echo "  debug build confirmed verbose"
+            fi
+
+            if "$BIN/llvm-readelf" -l "$SO" | awk '/LOAD/ {print $NF}' | grep -qx '0x1000'; then
+              fail "$ABI PT_LOAD still 4 KB-aligned - 16 KB devices cannot load it"
+            fi
+
+            if [ "$ABI" = "arm64-v8a" ]; then
+              NOTES="$("$BIN/llvm-readelf" -n "$SO" 2>/dev/null)"
+              PROPS_OK=0
+              if printf '%s' "$NOTES" | grep -qE '\bBTI\b' \
+                 && printf '%s' "$NOTES" | grep -qE '\bPAC\b'; then
+                PROPS_OK=1
+              elif printf '%s' "$NOTES" | grep -A1 'AARCH64_FEATURE_1_AND' \
+                   | grep -qE '0x0*3\b'; then
+                PROPS_OK=1
+              fi
+              if [ "$PROPS_OK" = 1 ]; then
+                echo "  arm64 branch protection note present (PAC+BTI)"
+              else
+                echo "  arm64 note absent BY DESIGN: libffi asm lacks BTI pads; PAC hardening still compiled in (see the CMakeLists BTI postmortem)"
+              fi
+            fi
+
+            if "$BIN/llvm-readelf" -d "$SO" | grep NEEDED | grep -q libz; then
+              fail "$ABI has a libz.so DT_NEEDED entry"
+            fi
+            if "$BIN/llvm-nm" -D --undefined-only "$SO" | grep -qE ' (uncompress|inflate|crc32)$'; then
+              fail "$ABI imports zlib inflate/crc32 symbols"
+            fi
+            if "$BIN/llvm-nm" -D --defined-only "$SO" | grep -qE ' (tinfl_|mz_|miniz)'; then
+              fail "$ABI exports vendored miniz symbols"
+            fi
+            if "$BIN/llvm-nm" -D --defined-only "$SO" | grep -qE ' (ffi_|_Z)'; then
+              fail "$ABI exports internal ffi_/C++ symbols"
+            fi
+
+            DEF="$("$BIN/llvm-nm" -D --defined-only "$SO" | grep -cE 'JNI_OnLoad|Java_com_' || true)"
+            echo "  exported JNI entry points: $DEF (expect 1 - JNI_OnLoad only)"
+            [ "$DEF" -eq 1 ] || fail "$ABI expected exactly 1 JNI export (JNI_OnLoad); loader natives bind via RegisterNatives, got $DEF"
+
+            SZ=$(stat -c %s "$SO")
+            echo "  $ABI ($MODE) size: $SZ bytes"
+            if [ "$MODE" = "release" ] && [ "$ABI" = "arm64-v8a" ]; then
+              [ "$SZ" -lt 420000 ] \
+                || fail "$ABI release build passed the 420000 ratchet (now $SZ bytes) - check what grew, then bump the cap"
+            fi
+          }
+
+          check_so build-arm64/libVMP.so         arm64-v8a    release
+          check_so build-armv7/libVMP.so         armeabi-v7a  release
+          check_so build-x86_64/libVMP.so        x86_64       release
+          check_so build-x86/libVMP.so           x86          release
+          check_so build-arm64-debug/libVMP.so arm64-v8a    debug
+          echo "All builds verified."
+          ls -la build-*/libVMP.so
+          sha1sum build-*/libVMP.so || true
+
+      # Upload release libraries for overlay into assets/vmp; keep debug separate.
+      - name: Prepare artifacts
+        if: ${{ !cancelled() && steps.build_release.outcome == 'success' }}
+        run: |
+          mkdir -p artifacts-release artifacts-debug
+          cp build-arm64/libVMP.so         artifacts-release/libVMP-arm64-v8a.so
+          cp build-armv7/libVMP.so         artifacts-release/libVMP-armeabi-v7a.so
+          cp build-x86_64/libVMP.so        artifacts-release/libVMP-x86_64.so
+          cp build-x86/libVMP.so           artifacts-release/libVMP-x86.so
+          cp build-arm64-debug/libVMP.so artifacts-debug/libVMP-arm64-v8a.so
+          echo "--- release: the authoritative VM. The repo ships none: overlay all"
+          echo "    four into the packer APK's assets/vmp/, then re-sign. ---"
+          ls -la artifacts-release/
+          echo "--- debug: replace the matching release library deliberately when debugging ---"
+          ls -la artifacts-debug/
+
+      - name: Upload release libraries
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: libVMP-release
+          path: native/artifacts-release/
+
+      - name: Upload debug library
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: libVMP-debug
+          path: native/artifacts-debug/
